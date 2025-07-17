@@ -1,321 +1,184 @@
-import Pkg; Pkg.add("PrettyTables")
+using Lux, Optimisers, Zygote, MLDatasets, OneHotArrays
+using Flux: onecold, logitcrossentropy
+using Statistics, Random, Plots, CUDA
+using Base.Iterators: partition
 
-using Lux, Optimisers, Random, MLDatasets, Statistics, Plots, Flux, Zygote
+DEVICE = CUDA.functional() ? gpu : cpu
 
 
-# -------------------------Question 1 ------------------------------
-# Implement a one hidden layer MLP, and vary the size of the hidden layer (10, 20, 40, 50, 100, 300) 
-# and train for 10 Epochs on FashionMNIST and store the final test accuracy. Then plot
-# the accuracy as a function of the hidden layer size.
-# -------------------------------------------------------------------
+# 1. Load FashionMNIST Dataset
+function load_data()
+    x_train, y_train = FashionMNIST.traindata(Float32)
+    x_test, y_test = FashionMNIST.testdata(Float32)
 
-# Set seed for reproducibility
-Random.seed!(1234)
+    x_train = reshape(x_train, :, size(x_train, 3)) |> DEVICE
+    x_test = reshape(x_test, :, size(x_test, 3)) |> DEVICE
 
-# Load FashionMNIST dataset
-train_x, train_y = FashionMNIST.traindata()
-test_x, test_y = FashionMNIST.testdata()
+    y_train = onehotbatch(y_train, 0:9) |> DEVICE
+    y_test = onehotbatch(y_test, 0:9) |> DEVICE
 
-# Normalize and reshape data
-function preprocess(x)
-    Float32.(reshape(x, :, size(x, 3))) ./ 255.0
+    return (x_train, y_train), (x_test, y_test)
 end
 
-x_train = preprocess(train_x)
-y_train = Flux.onehotbatch(train_y .+ 1, 1:10)
-
-x_test = preprocess(test_x)
-y_test = Flux.onehotbatch(test_y .+ 1, 1:10)
-
-# Training parameters
-learning_rate = 0.01
-batch_size = 128
-epochs = 10
-
-# Accuracy function
-function accuracy(model, x, y)
-    ŷ = model(x)
-    mean(Flux.onecold(ŷ) .== Flux.onecold(y))
-end
-
-# Training function
-function train_model(hidden_size; seed=1234)
-    Random.seed!(seed)
-    model = Lux.Chain(
-        Lux.Dense(28^2, hidden_size, relu),
-        Lux.Dense(hidden_size, 10)
+# 2. Model Builder
+function build_model(hidden_size)
+    Lux.Chain(
+        Lux.FlattenLayer(),
+        Lux.Dense(28^2 => hidden_size, relu),
+        Lux.Dense(hidden_size => 10)
     )
-    ps, st = Lux.setup(Random.default_rng(), model)
-    opt = Optimisers.setup(Optimisers.Adam(learning_rate), ps)
+end
+
+# 3. Loss Function
+function loss_fn(model, ps, st, x, y)
+    ŷ, st_ = Lux.apply(model, x, ps, st)
+    return mean(logitcrossentropy(ŷ, y)), st_
+end
+
+# 4. Accuracy Metric
+function accuracy(model, ps, st, x, y)
+    ŷ, _ = Lux.apply(model, x, ps, st)
+    y_pred = onecold(ŷ, 0:9)
+    y_true = onecold(y, 0:9)
+    return mean(y_pred .== y_true)
+end
+
+# 5. Training Loop
+function train(; h=128, bs=128, η=1e-3, epochs=10, decay=0.0, seed=42)
+    rng = MersenneTwister(seed)
+    model = build_model(h) |> DEVICE
+    ps, st = Lux.setup(rng, model)
+    opt = Optimisers.Adam(η)
+    opt_state = Optimisers.setup(opt, ps)
+
+    (x_train, y_train), (x_test, y_test) = load_data()
 
     for epoch in 1:epochs
-        for i in 1:batch_size:size(x_train, 2)
-            last = min(i + batch_size - 1, size(x_train, 2))
-            x_batch = x_train[:, i:last]
-            y_batch = y_train[:, i:last]
+        for batch in partition(1:size(x_train, 2), bs)
+            xb = x_train[:, batch]
+            yb = y_train[:, batch]
 
-            # Define loss function
-            function loss_fun(p)
-                ŷ, _ = model(x_batch, p, st)
-                Flux.logitcrossentropy(ŷ, y_batch)
-            end
-
-            # Compute gradients using Zygote
-            grads = Zygote.gradient(loss_fun, ps)[1]
-
-            # Update parameters
-            opt, ps = Optimisers.update(opt, ps, grads)
+            loss, back = Zygote.pullback(p -> loss_fn(model, Optimisers.getdata(p), st, xb, yb)[1], ps)
+            grads = back(1f0)[1]
+            ps, opt_state = Optimisers.update(opt_state, ps, grads)
         end
     end
 
-    ŷ_test, _ = model(x_test, ps, st)
-    return accuracy((x) -> first(model(x, ps, st)), x_test, y_test)
+    return accuracy(model, ps, st, x_test, y_test)
 end
 
-# Run experiment
-hidden_sizes = [10, 20, 40, 50, 100, 300]
-accuracies = [train_model(h) for h in hidden_sizes]
 
-# Plot results
-plot(
-        hidden_sizes, accuracies, xlabel="Hidden Layer Size", ylabel="Test Accuracy", 
-        title="Test Accuracy vs Hidden Layer Size", lw=2, marker=:circle
-    )
+# --------------------
+# Q1. Hidden Layer Size vs Accuracy
+# --------------------
+function q1_hidden_layer_size()
+    sizes = [10, 20, 40, 50, 100, 300]
+    results = Dict()
 
-
-#---------------------------------Question 2------------------------------------------
-# Use the same network with fixed hidden layer size of 30 to estimate the impact of random initialisation.
-# Run the network 10 times with different weight initialisation. Compute standard
-# deviation and mean. Visualize the datapoints in a plot to make the fluctuations of the final
-# test accuracy visible.
-#-------------------------------------------------------------------------------------
-
-# Fixed hidden size
-hidden_size_fixed = 30
-n_runs = 10
-seeds = rand(1:10^6, n_runs)
-
-# Train the model with different random initializations
-accuracies_random_init = [train_model(hidden_size_fixed, seed=s) for s in seeds]
-
-# Compute statistics
-mean_accuracy = mean(accuracies_random_init)
-std_accuracy = std(accuracies_random_init)
-
-println("Mean Accuracy: ", round(mean_accuracy * 100, digits=2), "%")
-println("Standard Deviation: ", round(std_accuracy * 100, digits=2), "%")
-
-# Plot results for random initializations
-scatter(
-    1:n_runs, accuracies_random_init,
-    xlabel = "Run Index",
-    ylabel = "Test Accuracy",
-    title = "Test Accuracy for 10 Random Initializations (Hidden Size = 30)",
-    legend = false,
-    marker = :circle
-)
-hline!([mean_accuracy], label="Mean", linestyle=:dash)
-
-
-#---------------------------------Question 3-------------------------------------------
-# Train the model with a batch size of 32 for 25 epochs. Use a decaying learning rate schedule
-# of your choice.
-#--------------------------------------------------------------------------------------
-
-batch_size_q3 = 32
-epochs_q3 = 25
-
-# Exponential decay function for learning rate
-function learning_rate_schedule(initial_lr, epoch, decay_rate=0.9)
-    return initial_lr * (decay_rate ^ (epoch - 1))
-end
-
-# Training function with learning rate schedule
-function train_with_decay(hidden_size; seed=1234, initial_lr=0.01, decay_rate=0.9)
-    Random.seed!(seed)
-    model = Lux.Chain(
-        Lux.Dense(28^2, hidden_size, relu),
-        Lux.Dense(hidden_size, 10)
-    )
-    ps, st = Lux.setup(Random.default_rng(), model)
-    opt_state = nothing
-
-    for epoch in 1:epochs_q3
-        current_lr = learning_rate_schedule(initial_lr, epoch, decay_rate)
-        opt = Optimisers.setup(Optimisers.Adam(current_lr), ps)
-
-        for i in 1:batch_size_q3:size(x_train, 2)
-            last = min(i + batch_size_q3 - 1, size(x_train, 2))
-            x_batch = x_train[:, i:last]
-            y_batch = y_train[:, i:last]
-
-            # Define loss function
-            function loss_fun(p)
-                ŷ, _ = model(x_batch, p, st)
-                Flux.logitcrossentropy(ŷ, y_batch)
-            end
-
-            # Compute gradients using Zygote
-            grads = Zygote.gradient(loss_fun, ps)[1]
-
-            # Update parameters
-            opt, ps = Optimisers.update(opt, ps, grads)
-        end
-
-        println("Epoch $epoch complete. Learning rate: $(round(current_lr, digits=5))")
+    for h in sizes
+        println("Training with hidden size $h")
+        acc = train(h=h, epochs=10)
+        results[h] = acc
     end
 
-    ŷ_test, _ = model(x_test, ps, st)
-    return accuracy((x) -> first(model(x, ps, st)), x_test, y_test)
+    bar(string.(keys(results)), values(results) .* 100,
+        xlabel="Hidden Size", ylabel="Accuracy (%)",
+        title="Q1: Hidden Layer Size vs Accuracy", legend=false)
 end
 
-# Run training for hidden layer size of 50
-final_accuracy = train_with_decay(50)
-println("Final Test Accuracy (Hidden Size = 50): ", round(final_accuracy * 100, digits=2), "%")
+# --------------------
+# Q2. Batch Size vs Accuracy
+# --------------------
+function q2_initialisation_effect()
+    hidden_size = 30
+    accuracies = Float64[]
 
-
-#----------------------------------Question 4------------------------------------------
-# Optimise the batch size and the learning rate schedule via a small grid search.
-#--------------------------------------------------------------------------------------
-
-hidden_size_q4 = 50
-epochs_q4 = 10
-
-# Grid parameters
-batch_sizes = [16, 32, 64, 128]
-initial_lrs = [0.001, 0.005, 0.01]
-decay_rates = [0.9, 0.95, 1.0]  # 1.0 means no decay
-
-# Store results
-results = []
-
-function train_with_grid(hidden_size, batch_size, initial_lr, decay_rate; seed=1234)
-    Random.seed!(seed)
-    model = Lux.Chain(
-        Lux.Dense(28^2, hidden_size, relu),
-        Lux.Dense(hidden_size, 10)
-    )
-    ps, st = Lux.setup(Random.default_rng(), model)
-
-    for epoch in 1:epochs_q4
-        current_lr = initial_lr * (decay_rate ^ (epoch - 1))
-        opt = Optimisers.setup(Optimisers.Adam(current_lr), ps)
-
-        for i in 1:batch_size:size(x_train, 2)
-            last = min(i + batch_size - 1, size(x_train, 2))
-            x_batch = x_train[:, i:last]
-            y_batch = y_train[:, i:last]
-
-            # Loss
-            function loss_fun(p)
-                ŷ, _ = model(x_batch, p, st)
-                Flux.logitcrossentropy(ŷ, y_batch)
-            end
-
-            # Gradient and update
-            grads = Zygote.gradient(loss_fun, ps)[1]
-            opt, ps = Optimisers.update(opt, ps, grads)
-        end
+    for seed in 1:10
+        println("Run $seed")
+        acc = train(h=hidden_size, seed=seed)
+        push!(accuracies, acc)
     end
 
-    ŷ_test, _ = model(x_test, ps, st)
-    return accuracy((x) -> first(model(x, ps, st)), x_test, y_test)
+    μ = mean(accuracies)
+    σ = std(accuracies)
+    println("Mean Accuracy: $(round(μ * 100, digits=2))%")
+    println("Std Dev: $(round(σ * 100, digits=2))%")
+
+    scatter(1:10, accuracies .* 100,
+        xlabel="Run", ylabel="Accuracy (%)",
+        title="Q2: Accuracy for 10 Random Initialisations",
+        label="Accuracy", legend=true)
+    hline!([μ * 100], label="Mean")
 end
 
-# Run grid search
-for bs in batch_sizes
-    for lr in initial_lrs
-        for dr in decay_rates
-            acc = train_with_grid(hidden_size_q4, bs, lr, dr)
-            push!(results, (batch_size=bs, initial_lr=lr, decay_rate=dr, accuracy=acc))
-            println("Batch Size=$bs, LR=$lr, Decay=$dr --> Accuracy = $(round(acc*100, digits=2))%")
+# --------------------
+# Q3. Learning Rate vs Accuracy
+# --------------------
+function train_with_decay(; h=128, bs=32, η=1e-2, epochs=25, decay_factor=0.9)
+    rng = MersenneTwister(42)
+    model = build_model(h) |> DEVICE
+    ps, st = Lux.setup(rng, model)
+    opt = Optimisers.Adam(η)
+    opt_state = Optimisers.setup(opt, ps)
+
+    (x_train, y_train), (x_test, y_test) = load_data()
+
+    for epoch in 1:epochs
+        lr = η * decay_factor^epoch
+        opt = Optimisers.Adam(lr)
+        for batch in partition(1:size(x_train, 2), bs)
+            xb = x_train[:, batch]
+            yb = y_train[:, batch]
+
+            loss, back = Zygote.pullback(p -> loss_fn(model, p, st, xb, yb)[1], ps)
+            grads = back(1f0)[1]
+            ps, opt_state = Optimisers.update(opt_state, ps, grads)
         end
+        acc = accuracy(model, ps, st, x_test, y_test)
+        println("Epoch $epoch | Accuracy: $(round(acc * 100, digits=2))% | LR: $(round(lr, sigdigits=2))")
     end
 end
 
-# Convert to DataFrame for visualization
-using DataFrames
-df_results = DataFrame(results)
+# --------------------
+# Q4. Weight Decay vs Accuracy
+# --------------------
+function q4_grid_search()
+    bss = [32, 64]
+    lrs = [1e-3, 5e-3, 1e-2]
+    results = Dict()
 
-# Display results
-using Statistics
-using Plots
-using Printf
-using PrettyTables
-
-pretty_table(df_results)
-
-# Optional: visualize best combinations
-best = sort(df_results, :accuracy, rev=true)[1:5, :]
-println("\nTop 5 Configurations:")
-pretty_table(best)
-
-
-#----------------------------------Question 5------------------------------------------
-# Use the parameters which yield the best and train the network. Did you improve your result in 3?
-#--------------------------------------------------------------------------------------
-
-sorted_results = sort(df_results, :accuracy, rev=true)
-best_config = sorted_results[1, :]  # Highest accuracy row
-
-# Display best configuration
-println("\nBest configuration from grid search:")
-@printf("Batch Size = %d, Initial LR = %.4f, Decay Rate = %.2f\n", 
-    best_config.batch_size, best_config.initial_lr, best_config.decay_rate)
-
-# Use the best configuration to retrain
-function train_with_best_config(hidden_size, batch_size, initial_lr, decay_rate; seed=1234)
-    Random.seed!(seed)
-    model = Lux.Chain(
-        Lux.Dense(28^2, hidden_size, relu),
-        Lux.Dense(hidden_size, 10)
-    )
-    ps, st = Lux.setup(Random.default_rng(), model)
-
-    for epoch in 1:epochs_q3  # Same number of epochs as Question 3
-        current_lr = initial_lr * (decay_rate ^ (epoch - 1))
-        opt = Optimisers.setup(Optimisers.Adam(current_lr), ps)
-
-        for i in 1:batch_size:size(x_train, 2)
-            last = min(i + batch_size - 1, size(x_train, 2))
-            x_batch = x_train[:, i:last]
-            y_batch = y_train[:, i:last]
-
-            # Loss
-            function loss_fun(p)
-                ŷ, _ = model(x_batch, p, st)
-                Flux.logitcrossentropy(ŷ, y_batch)
-            end
-
-            grads = Zygote.gradient(loss_fun, ps)[1]
-            opt, ps = Optimisers.update(opt, ps, grads)
-        end
-
-        println("Epoch $epoch complete. LR: $(round(current_lr, digits=5))")
+    for bs in bss, lr in lrs
+        println("Trying BS=$bs, LR=$lr")
+        acc = train(h=128, bs=bs, η=lr, epochs=10)
+        results[(bs, lr)] = acc
     end
 
-    ŷ_test, _ = model(x_test, ps, st)
-    return accuracy((x) -> first(model(x, ps, st)), x_test, y_test)
-end
-
-# Retrain using best config
-final_accuracy_best = train_with_best_config(
-    hidden_size_q4,
-    best_config.batch_size,
-    best_config.initial_lr,
-    best_config.decay_rate
-)
-
-println("\nFinal Test Accuracy using Best Config: $(round(final_accuracy_best * 100, digits=2))%")
-
-# Compare with Question 3 result
-println("Final Test Accuracy from Question 3 (decaying LR, bs=32): $(round(final_accuracy * 100, digits=2))%")
-
-if final_accuracy_best > final_accuracy
-    println("\nThe optimized parameters improved the test accuracy.")
-else
-    println("\nNo improvement over previous setup.")
+    for ((bs, lr), acc) in results
+        println("BS=$bs, LR=$lr => Accuracy=$(round(acc * 100, digits=2))%")
+    end
 end
 
 
-# ------------------------------------------------------------------------------------------------
+function q5_train_best()
+    best_bs = 64
+    best_lr = 1e-2
+
+    println("Training best config: BS=$best_bs, LR=$best_lr")
+    final_acc = train(h=128, bs=best_bs, η=best_lr, epochs=25)
+    println("Final Accuracy with Best Params: $(round(final_acc * 100, digits=2))%")
+end
+
+# --------------------
+# Run All HW4 Questions
+# --------------------
+function run_all_hw4()
+    q1_hidden_layer_size(); gui()
+    q2_initialisation_effect(); gui()
+    train_with_decay();  # Q3
+    q4_grid_search()     # Q4
+    q5_train_best()      # Q5
+end
+
+
+# Run the full experiment
+run_hw4_all()
